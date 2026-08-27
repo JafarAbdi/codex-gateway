@@ -43,7 +43,7 @@ Point each Shelley at it:
 - `codex-gateway check` probes /healthz and exits non-zero when unreachable — a
   container health check with no shell or curl. rustls bundles its CA roots and a musl
   build is fully static, so `scratch` images work.
-- Logs go to stderr (`RUST_LOG`): one line per request — status, model, latency.
+- Logs go to stderr: one line per request — status, model, latency.
   Never bodies.
 - Don't export `OPENAI_API_KEY` in Shelley's env; it relabels the UI model source.
 

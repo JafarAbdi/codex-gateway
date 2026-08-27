@@ -204,7 +204,7 @@ impl Auth {
         }
         save(&self.path, &state.file)
             .map_err(|err| AuthError::Transient(format!("persisting credentials: {err}")))?;
-        tracing::info!("refreshed ChatGPT access token");
+        eprintln!("refreshed ChatGPT access token");
         Ok(())
     }
 }

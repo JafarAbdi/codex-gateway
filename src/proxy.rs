@@ -24,9 +24,44 @@ pub struct Gateway {
 /// timeout would sever long SSE streams.
 pub fn client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .cookie_store(true)
+        .cookie_provider(Arc::new(Jar::default()))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
+}
+
+/// Single-upstream cookie jar: name=value pairs, last write wins. The one upstream
+/// host makes domain/path/expiry handling (and the public-suffix list) dead weight.
+#[derive(Default)]
+struct Jar(std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+impl reqwest::cookie::CookieStore for Jar {
+    fn set_cookies(
+        &self,
+        cookie_headers: &mut dyn Iterator<Item = &axum::http::HeaderValue>,
+        _url: &reqwest::Url,
+    ) {
+        let mut jar = self.0.lock().expect("cookie jar lock");
+        for header in cookie_headers {
+            let Ok(text) = header.to_str() else { continue };
+            let pair = text.split(';').next().unwrap_or_default();
+            if let Some((name, value)) = pair.split_once('=') {
+                jar.insert(name.trim().to_owned(), value.trim().to_owned());
+            }
+        }
+    }
+
+    fn cookies(&self, _url: &reqwest::Url) -> Option<axum::http::HeaderValue> {
+        let jar = self.0.lock().expect("cookie jar lock");
+        if jar.is_empty() {
+            return None;
+        }
+        let joined = jar
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        axum::http::HeaderValue::from_str(&joined).ok()
+    }
 }
 
 pub fn router(gateway: Gateway) -> Router {
@@ -66,13 +101,16 @@ async fn forward(State(gateway): State<Gateway>, body: Bytes) -> Response {
         Err(err) => return auth_error_response(err),
     };
     // Level 3, unconditional — pi's fallback only covers Node runtimes without zstd.
-    let body = zstd::encode_all(
-        serde_json::to_vec(&request)
-            .expect("JSON value serializes")
-            .as_slice(),
-        3,
-    )
-    .expect("in-memory zstd compression");
+    // Bytes so the 401 replay reuses the buffer without copying.
+    let body = Bytes::from(
+        zstd::encode_all(
+            serde_json::to_vec(&request)
+                .expect("JSON value serializes")
+                .as_slice(),
+            3,
+        )
+        .expect("in-memory zstd compression"),
+    );
 
     let mut response = match send_upstream(&gateway, &body, &cache_key, &token, &account_id).await {
         Ok(response) => response,
@@ -85,10 +123,7 @@ async fn forward(State(gateway): State<Gateway>, body: Bytes) -> Response {
             Ok(credentials) => credentials,
             Err(err) => return auth_error_response(err),
         };
-        tracing::warn!(
-            model,
-            "upstream 401; replaying once with recovered credential"
-        );
+        eprintln!("upstream 401 for {model}; replaying once with recovered credential");
         response = match send_upstream(&gateway, &body, &cache_key, &token, &account_id).await {
             Ok(response) => response,
             Err(err) => return upstream_error_response(err, &model),
@@ -96,11 +131,9 @@ async fn forward(State(gateway): State<Gateway>, body: Bytes) -> Response {
     }
 
     let status = response.status();
-    tracing::info!(
-        %status,
-        model,
-        header_ms = started.elapsed().as_millis() as u64,
-        "POST /openai/v1/responses"
+    eprintln!(
+        "POST /openai/v1/responses {status} model={model} header_ms={}",
+        started.elapsed().as_millis()
     );
     let mut relayed = Response::builder().status(status.as_u16());
     for (name, value) in response.headers() {
@@ -117,7 +150,7 @@ async fn forward(State(gateway): State<Gateway>, body: Bytes) -> Response {
 /// trusted set replaces them.
 async fn send_upstream(
     gateway: &Gateway,
-    body: &[u8],
+    body: &Bytes,
     cache_key: &Option<String>,
     token: &AccessToken,
     account_id: &AccountId,
@@ -138,13 +171,13 @@ async fn send_upstream(
             .header("session-id", key)
             .header("x-client-request-id", key);
     }
-    upstream.body(body.to_vec()).send().await
+    upstream.body(body.clone()).send().await
 }
 
 fn auth_error_response(err: AuthError) -> Response {
     match err {
         AuthError::LoginRequired(_) => {
-            tracing::error!(%err, "rejecting request");
+            eprintln!("rejecting request: {err}");
             error_response(StatusCode::UNAUTHORIZED, &err.to_string())
         }
         AuthError::Transient(_) => error_response(StatusCode::BAD_GATEWAY, &err.to_string()),
@@ -152,7 +185,7 @@ fn auth_error_response(err: AuthError) -> Response {
 }
 
 fn upstream_error_response(err: reqwest::Error, model: &str) -> Response {
-    tracing::error!(%err, model, "upstream request failed");
+    eprintln!("upstream request failed for {model}: {err}");
     error_response(
         StatusCode::BAD_GATEWAY,
         &format!("upstream request failed: {err}"),
@@ -232,5 +265,35 @@ mod tests {
     fn adapt_rejects_non_object_bodies() {
         assert!(adapt_request(b"not json").is_err());
         assert!(adapt_request(b"[1,2]").is_err());
+    }
+
+    #[test]
+    fn jar_stores_and_replays_cookies_last_write_wins() {
+        use reqwest::cookie::CookieStore;
+        let jar = Jar::default();
+        let url = reqwest::Url::parse("https://chatgpt.com/backend-api/codex/responses")
+            .expect("parse url");
+        let set = |jar: &Jar, values: &[&str]| {
+            let headers: Vec<axum::http::HeaderValue> = values
+                .iter()
+                .map(|value| axum::http::HeaderValue::from_str(value).expect("header"))
+                .collect();
+            jar.set_cookies(&mut headers.iter(), &url);
+        };
+        assert!(jar.cookies(&url).is_none(), "empty jar sends no header");
+        set(
+            &jar,
+            &[
+                "__cf_bm=first; Path=/; Secure; HttpOnly",
+                "cf_clearance=abc; Path=/",
+            ],
+        );
+        set(&jar, &["__cf_bm=second; Path=/"]);
+        let header = jar.cookies(&url).expect("cookie header");
+        let sent = header.to_str().expect("ascii");
+        assert!(sent.contains("__cf_bm=second"), "last write wins: {sent}");
+        assert!(!sent.contains("first"));
+        assert!(sent.contains("cf_clearance=abc"));
+        assert!(!sent.contains("Path"), "attributes never leak: {sent}");
     }
 }
