@@ -10,7 +10,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::CLIENT_ID;
+use crate::{CLIENT_ID, logging};
 
 /// JWT claim object holding the ChatGPT account id.
 const AUTH_CLAIM: &str = "https://api.openai.com/auth";
@@ -204,7 +204,7 @@ impl Auth {
         }
         save(&self.path, &state.file)
             .map_err(|err| AuthError::Transient(format!("persisting credentials: {err}")))?;
-        eprintln!("refreshed ChatGPT access token");
+        logging::success(format_args!("refreshed ChatGPT access token"));
         Ok(())
     }
 }
@@ -231,6 +231,24 @@ fn auth_http() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
+fn print_plan(access_token: &str) {
+    if let Some(plan) = jwt_payload(access_token).and_then(|claims| {
+        claims[AUTH_CLAIM]["chatgpt_plan_type"]
+            .as_str()
+            .map(str::to_owned)
+    }) {
+        println!("Logged in to a ChatGPT {plan} account.");
+    }
+}
+
+fn device_poll_interval(value: Option<&Value>) -> Duration {
+    let seconds = value
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        .unwrap_or(5)
+        .max(1);
+    Duration::from_secs(seconds)
+}
+
 /// Device-code login; polling is the protocol (server-paced interval).
 pub async fn login(path: &Path, issuer: &str) -> anyhow::Result<()> {
     let http = auth_http()?;
@@ -254,14 +272,7 @@ pub async fn login(path: &Path, issuer: &str) -> anyhow::Result<()> {
     }
     let user_code: UserCode = resp.error_for_status()?.json().await?;
     // Arrives as a number or a numeric string.
-    let mut interval = Duration::from_secs(
-        user_code
-            .interval
-            .as_ref()
-            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
-            .unwrap_or(5)
-            .max(1),
-    );
+    let mut interval = device_poll_interval(user_code.interval.as_ref());
 
     println!(
         "Visit {issuer}/codex/device and enter code: {}",
@@ -328,13 +339,7 @@ pub async fn login(path: &Path, issuer: &str) -> anyhow::Result<()> {
             .await?;
 
         let account_id = jwt_account_id(&tokens.access_token);
-        if let Some(plan) = jwt_payload(&tokens.access_token).and_then(|claims| {
-            claims[AUTH_CLAIM]["chatgpt_plan_type"]
-                .as_str()
-                .map(str::to_owned)
-        }) {
-            println!("Logged in to a ChatGPT {plan} account.");
-        }
+        print_plan(&tokens.access_token);
         let file = AuthFile {
             tokens: Tokens {
                 access_token: tokens.access_token,

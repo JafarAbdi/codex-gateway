@@ -1,0 +1,21 @@
+repos:
+  - repo: https://github.com/JafarAbdi/cccc-pre-commit
+    rev: v1.6.0
+    hooks:
+      - id: cccc
+        args: [--max-cyclomatic=10, --top-cyclomatic=20, --table]
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+

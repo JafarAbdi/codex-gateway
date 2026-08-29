@@ -3,6 +3,7 @@
 //! All wire behavior is ported — see PROVENANCE.md before changing constants.
 
 pub mod auth;
+mod logging;
 pub mod proxy;
 
 /// Codex CLI's OAuth client id (pi uses it too).

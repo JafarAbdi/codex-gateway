@@ -14,7 +14,7 @@ use axum::routing::post;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex_gateway::auth::Auth;
-use codex_gateway::proxy::{Gateway, client, router};
+use codex_gateway::proxy::{Gateway, INBOUND_BODY_LIMIT_BYTES, client, router};
 use serde_json::{Value, json};
 
 const SSE_BODY: &str =
@@ -119,6 +119,7 @@ async fn injects_credentials_and_relays_sse() {
     let response = reqwest::Client::new()
         .post(format!("http://{gateway}/openai/v1/responses"))
         .header("authorization", "Bearer implicit")
+        .header("Shelley-Request-Id", "shelley-request-1")
         .json(&json!({
             "model": "gpt-5.4",
             "max_output_tokens": 32768,
@@ -161,9 +162,95 @@ async fn injects_credentials_and_relays_sse() {
         headers["content-encoding"].to_str().expect("ascii header"),
         "zstd"
     );
+    assert!(
+        !headers.contains_key("shelley-request-id"),
+        "caller request id must not be forwarded upstream"
+    );
     assert!(body.get("max_output_tokens").is_none());
     assert_eq!(body["store"], json!(false));
     assert_eq!(body["stream"], json!(true));
+}
+
+#[tokio::test]
+async fn request_larger_than_old_axum_limit_reaches_upstream() {
+    let captured = Captured::default();
+    let upstream = serve(
+        Router::new()
+            .route("/responses", post(upstream_handler))
+            .with_state(captured.clone()),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let auth_path = dir.path().join("auth.json");
+    write_auth_file(&auth_path, &fake_jwt(far_future(), "acct"));
+    let gateway = start_gateway(
+        &auth_path,
+        "http://unused.invalid".into(),
+        format!("http://{upstream}/responses"),
+    )
+    .await;
+
+    let payload = "x".repeat(2 * 1024 * 1024);
+    let response = reqwest::Client::new()
+        .post(format!("http://{gateway}/openai/v1/responses"))
+        .json(&json!({"model": "gpt-5.4", "input": payload}))
+        .send()
+        .await
+        .expect("large request to gateway");
+    assert_eq!(response.status(), 200);
+
+    let requests = captured.0.lock().expect("lock captured requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].1["input"]
+            .as_str()
+            .expect("input remains a string")
+            .len(),
+        2 * 1024 * 1024
+    );
+}
+
+#[tokio::test]
+async fn request_over_inbound_limit_returns_json_413() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let auth_path = dir.path().join("auth.json");
+    write_auth_file(&auth_path, &fake_jwt(far_future(), "acct"));
+    let gateway = start_gateway(
+        &auth_path,
+        "http://unused.invalid".into(),
+        "http://unused.invalid/responses".into(),
+    )
+    .await;
+
+    let received_bytes = INBOUND_BODY_LIMIT_BYTES + 1;
+    let mut body = br#"{"model":"gpt-5.4","input":""#.to_vec();
+    body.resize(received_bytes - 2, b'x');
+    body.extend_from_slice(br#""}"#);
+    assert_eq!(body.len(), received_bytes);
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{gateway}/openai/v1/responses"))
+        .header("Shelley-Request-Id", "oversized-request")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("oversized request to gateway");
+    assert_eq!(response.status(), 413);
+    assert_eq!(
+        response.headers()["content-type"]
+            .to_str()
+            .expect("ascii header"),
+        "application/json"
+    );
+    let error: Value = response.json().await.expect("JSON error response");
+    assert_eq!(
+        error["error"]["message"],
+        json!(format!(
+            "request body exceeds the 64 MiB limit ({INBOUND_BODY_LIMIT_BYTES} bytes); received Content-Length {received_bytes} bytes"
+        ))
+    );
 }
 
 #[tokio::test]

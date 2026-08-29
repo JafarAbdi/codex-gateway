@@ -1,11 +1,25 @@
 //! Thin CLI over the library: `codex-gateway login | serve | check`.
 
+use std::fmt::Arguments;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use codex_gateway::{ISSUER, UPSTREAM_URL, auth, proxy};
+
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_CYAN: &str = "\x1b[36m";
+
+fn log_stderr(color: &str, message: Arguments<'_>) {
+    if std::env::var_os("NO_COLOR").is_some() {
+        eprintln!("{message}");
+    } else {
+        eprintln!("{color}{message}{ANSI_RESET}");
+    }
+}
 
 const USAGE: &str = "\
 Shared ChatGPT Codex OAuth gateway for Shelley
@@ -39,21 +53,28 @@ struct Cli {
     listen: SocketAddr,
 }
 
+fn handle_info_flag(arg: &str) {
+    match arg {
+        "-h" | "--help" => {
+            print!("{USAGE}");
+            std::process::exit(0);
+        }
+        "-V" | "--version" => {
+            println!("codex-gateway {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        _ => {}
+    }
+}
+
 fn parse_args() -> Result<Cli> {
     let mut auth_file = std::env::var_os("CODEX_GATEWAY_AUTH").map(PathBuf::from);
     let mut command = None;
     let mut listen = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        handle_info_flag(&arg);
         match arg.as_str() {
-            "-h" | "--help" => {
-                print!("{USAGE}");
-                std::process::exit(0);
-            }
-            "-V" | "--version" => {
-                println!("codex-gateway {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
             "--auth-file" => {
                 auth_file = Some(args.next().context("--auth-file needs a value")?.into());
             }
@@ -95,7 +116,7 @@ impl axum::serve::Listener for NoDelay {
                     let _ = stream.set_nodelay(true);
                     return (stream, addr);
                 }
-                Err(err) => eprintln!("accept failed: {err}"),
+                Err(err) => log_stderr(ANSI_RED, format_args!("accept failed: {err}")),
             }
         }
     }
@@ -143,10 +164,13 @@ async fn main() -> Result<()> {
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                         .expect("install SIGTERM handler");
                 term.recv().await;
-                eprintln!("SIGTERM received; exiting");
+                log_stderr(ANSI_YELLOW, format_args!("SIGTERM received; exiting"));
                 std::process::exit(0);
             });
-            eprintln!("codex-gateway serving on {} -> {UPSTREAM_URL}", cli.listen);
+            log_stderr(
+                ANSI_CYAN,
+                format_args!("codex-gateway serving on {} -> {UPSTREAM_URL}", cli.listen),
+            );
             axum::serve(listener, proxy::router(gateway)).await?;
             Ok(())
         }

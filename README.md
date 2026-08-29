@@ -43,8 +43,9 @@ Point each Shelley at it:
 - `codex-gateway check` probes /healthz and exits non-zero when unreachable — a
   container health check with no shell or curl. rustls bundles its CA roots and a musl
   build is fully static, so `scratch` images work.
-- Logs go to stderr: one line per request — status, model, latency.
-  Never bodies.
+- Request bodies are capped at 64 MiB and zstd-compressed upstream.
+- Colored stderr logs include status, model, request ID, body sizes, and latency;
+  never bodies or credentials. `NO_COLOR=1` disables color.
 - Don't export `OPENAI_API_KEY` in Shelley's env; it relabels the UI model source.
 
 Every wire detail is ported from openai/codex, earendil-works/pi, or
