@@ -268,6 +268,20 @@ async fn send_upstream(
     upstream.body(body.clone()).send().await
 }
 
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut chain = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        let message = error.to_string();
+        if !chain.ends_with(&message) {
+            chain.push_str(": ");
+            chain.push_str(&message);
+        }
+        source = error.source();
+    }
+    chain
+}
+
 fn body_rejection_response(
     error: BytesRejection,
     content_length: Option<u64>,
@@ -298,21 +312,15 @@ fn body_rejection_response(
             );
             error_response(StatusCode::PAYLOAD_TOO_LARGE, &message)
         }
-        BytesRejection::FailedToBufferBody(FailedToBufferBody::UnknownBodyError(error)) => {
-            logging::status(
-                StatusCode::BAD_REQUEST.as_u16(),
-                format_args!(
-                    "POST /openai/v1/responses status=400 shelley_request_id={:?} body_buffer_error={error}",
-                    request_id.unwrap_or("-")
-                ),
-            );
-            error_response(StatusCode::BAD_REQUEST, "failed to buffer request body")
-        }
         error => {
+            let content_length_log = content_length
+                .map(|bytes| format!(" content_length={bytes}"))
+                .unwrap_or_default();
+            let error = error_chain(&error);
             logging::status(
                 StatusCode::BAD_REQUEST.as_u16(),
                 format_args!(
-                    "POST /openai/v1/responses status=400 shelley_request_id={:?} body_buffer_error={error}",
+                    "POST /openai/v1/responses status=400 shelley_request_id={:?}{content_length_log} body_buffer_error={error:?}",
                     request_id.unwrap_or("-")
                 ),
             );
