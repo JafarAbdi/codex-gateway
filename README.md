@@ -1,12 +1,18 @@
 # codex-gateway
 
-Share one ChatGPT Plus/Pro Codex subscription across many Shelley instances.
+Share one ChatGPT Plus/Pro Codex subscription across many [pi] instances.
 
-The gateway owns the OAuth credential and forwards `POST /openai/v1/responses` to
-`https://chatgpt.com/backend-api/codex/responses`, streaming the SSE response back
-untouched. Every other path is 404. On the way through it strips `max_output_tokens`,
-forces `store:false`/`stream:true`, zstd-compresses the body, and replaces caller auth
-with the shared bearer token and account-id headers.
+The gateway owns the OAuth credential and forwards pi's own Codex requests to
+`https://chatgpt.com/backend-api/codex/responses` untouched, replacing only the caller's
+credentials with the shared bearer token and account-id headers:
+
+- `POST /codex/responses` forwards the (zstd) body byte for byte and streams SSE back.
+- `GET /codex/responses` upgrades to a WebSocket and relays messages both ways, so pi sends
+  only each turn's new input. pi falls back to SSE when a WebSocket fails, so both stay.
+
+Every other path is 404.
+
+[pi]: https://github.com/earendil-works/pi
 
 Run it on a private network (tailscale). Whoever can reach it can spend the
 subscription; nobody can read the credential.
@@ -22,9 +28,15 @@ security settings first. Credentials land in `~/.codex-gateway/auth.json` (0600;
 override with `--auth-file` or `CODEX_GATEWAY_AUTH`). `serve` defaults to
 `127.0.0.1:8787`; there is no caller auth, so bind only loopback or a private address.
 
-Point each Shelley at it:
+Point pi's `openai-codex` provider at it in `~/.pi/agent/models.json`. pi reads the
+account id out of its token before sending, so `apiKey` is a placeholder JWT whose
+payload is `{"https://api.openai.com/auth": {"chatgpt_account_id": "gateway"}}`; the
+gateway replaces it:
 
-    { "llm_gateway": "http://<tailnet-host>:8787" }
+    { "providers": { "openai-codex": {
+        "baseUrl": "http://<tailnet-host>:8787",
+        "apiKey": "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiZ2F0ZXdheSJ9fQ.gateway"
+    } } }
 
 ## Credentials
 
@@ -37,20 +49,18 @@ Point each Shelley at it:
 
 ## Operating
 
-- Only OpenAI models work; Shelley's Anthropic/xAI/Fireworks entries get a clean 404.
-- The gateway never retries or masks upstream errors; Shelley retries 429/5xx itself.
+- The gateway never retries or masks upstream errors; pi retries 429/5xx itself. A
+  refused WebSocket handshake is relayed with the backend's status and body.
 - `GET /healthz` reports `{"auth":"ok"}` or `{"auth":"login required"}`.
 - `codex-gateway check` probes /healthz and exits non-zero when unreachable — a
   container health check with no shell or curl. rustls bundles its CA roots and a musl
   build is fully static, so `scratch` images work.
-- Request bodies are capped at 64 MiB and zstd-compressed upstream.
-- Colored stderr logs include status, model, request ID, body sizes, and latency;
-  never bodies or credentials. `NO_COLOR=1` disables color.
-- Don't export `OPENAI_API_KEY` in Shelley's env; it relabels the UI model source.
+- No body or message size caps of its own; the backend enforces its limits.
+- Colored stderr logs include status, session id, body size, latency and WebSocket
+  lifetimes; never bodies, messages or credentials. `NO_COLOR=1` disables color.
 
-Every wire detail is ported from openai/codex, earendil-works/pi, or
-boldsoftware/shelley; [PROVENANCE.md](PROVENANCE.md) maps each to its source at a
-pinned commit.
+Every wire detail is ported from openai/codex or earendil-works/pi;
+[PROVENANCE.md](PROVENANCE.md) maps each to its source at a pinned commit.
 
 ## License
 

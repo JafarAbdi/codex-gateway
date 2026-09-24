@@ -1,23 +1,42 @@
-//! The one route: adapt minimally, inject the credential, stream SSE back untouched.
+//! The one route: pi's own Codex requests, forwarded untouched with the shared credential.
+//! `POST` carries a request body and streams SSE back; `GET` upgrades to a WebSocket that
+//! is relayed message for message.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::rejection::{BytesRejection, FailedToBufferBody};
+use axum::extract::rejection::BytesRejection;
+use axum::extract::ws::{self, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::Response;
 use axum::routing::post;
-use serde_json::{Value, json};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::json;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::{self as ts, http::HeaderValue};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::auth::{AccessToken, AccountId, Auth, AuthError};
 use crate::logging;
 
-/// Room for Shelley's 20 MiB images after base64 encoding plus Responses context.
-pub const INBOUND_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
-const SHELLEY_REQUEST_ID: &str = "shelley-request-id";
+/// pi's own request headers; its placeholder credentials never pass.
+const FORWARDED_HEADERS: [HeaderName; 8] = [
+    header::ACCEPT,
+    header::CONTENT_TYPE,
+    header::CONTENT_ENCODING,
+    header::USER_AGENT,
+    HeaderName::from_static("originator"),
+    HeaderName::from_static("openai-beta"),
+    HeaderName::from_static("session-id"),
+    HeaderName::from_static("x-client-request-id"),
+];
+const SESSION_ID: HeaderName = HeaderName::from_static("session-id");
+
+type Upstream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Clone)]
 pub struct Gateway {
@@ -71,11 +90,14 @@ impl reqwest::cookie::CookieStore for Jar {
 }
 
 pub fn router(gateway: Gateway) -> Router {
-    // Shelley's /anthropic, /xai, /fireworks prefixes fall to 404 (terminal in Shelley).
+    // No body or message caps of our own: only trusted callers reach the gateway, and
+    // the backend enforces its limits.
     Router::new()
         .route(
-            "/openai/v1/responses",
-            post(forward).layer(DefaultBodyLimit::max(INBOUND_BODY_LIMIT_BYTES)),
+            "/codex/responses",
+            post(forward)
+                .get(connect)
+                .layer(DefaultBodyLimit::disable()),
         )
         .route("/healthz", axum::routing::get(healthz))
         .with_state(gateway)
@@ -108,48 +130,29 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-struct InboundRequest {
-    value: Value,
-    request_id: Option<String>,
-    bytes: usize,
+fn session_id(headers: &HeaderMap) -> &str {
+    headers
+        .get(SESSION_ID)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
 }
 
-fn extract_inbound(
-    headers: &HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Result<InboundRequest, Box<Response>> {
-    let request_id = headers
-        .get(SHELLEY_REQUEST_ID)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let content_length = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
-    let body = body.map_err(|error| {
-        Box::new(body_rejection_response(
-            error,
-            content_length,
-            request_id.as_deref(),
-        ))
-    })?;
-    let bytes = body.len();
-    let readable_bytes = human_bytes(bytes as u64);
-    let value = adapt_request(&body).map_err(|message| {
-        logging::status(
-            StatusCode::BAD_REQUEST.as_u16(),
-            format_args!(
-                "POST /openai/v1/responses status=400 shelley_request_id={:?} body={readable_bytes} error={message:?}",
-                request_id.as_deref().unwrap_or("-")
-            ),
-        );
-        Box::new(error_response(StatusCode::BAD_REQUEST, message))
-    })?;
-    Ok(InboundRequest {
-        value,
-        request_id,
-        bytes,
-    })
+fn forwarded(headers: &HeaderMap) -> HeaderMap {
+    FORWARDED_HEADERS
+        .iter()
+        .filter_map(|name| Some((name.clone(), headers.get(name)?.clone())))
+        .collect()
+}
+
+/// The shared credential, in place of the caller's.
+fn credential_headers(token: &AccessToken, account_id: &AccountId) -> [(HeaderName, String); 2] {
+    [
+        (header::AUTHORIZATION, format!("Bearer {}", token.as_str())),
+        (
+            HeaderName::from_static("chatgpt-account-id"),
+            account_id.as_str().to_owned(),
+        ),
+    ]
 }
 
 async fn forward(
@@ -158,34 +161,12 @@ async fn forward(
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     let started = Instant::now();
-    let InboundRequest {
-        value: request,
-        request_id,
-        bytes: inbound_bytes,
-    } = match extract_inbound(&headers, body) {
-        Ok(request) => request,
-        Err(response) => return *response,
+    let session = session_id(&headers);
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => return body_rejection_response(&error, session),
     };
-    let model = request["model"].as_str().unwrap_or("?").to_owned();
-    // Shelley's conversation id; doubles as the upstream session id.
-    let cache_key = request["prompt_cache_key"].as_str().map(str::to_owned);
-
-    // Level 3, unconditional — pi's fallback only covers Node runtimes without zstd.
-    // Bytes so the 401 replay reuses the buffer without copying.
-    let upstream_body = Bytes::from(
-        zstd::encode_all(
-            serde_json::to_vec(&request)
-                .expect("JSON value serializes")
-                .as_slice(),
-            3,
-        )
-        .expect("in-memory zstd compression"),
-    );
-    let upstream_zstd_bytes = upstream_body.len();
-    let inbound_size = human_bytes(inbound_bytes as u64);
-    let upstream_zstd_size = human_bytes(upstream_zstd_bytes as u64);
-
-    let response = match send_with_recovery(&gateway, &upstream_body, &cache_key, &model).await {
+    let response = match send_with_recovery(&gateway, &headers, &body).await {
         Ok(response) => response,
         Err(response) => return *response,
     };
@@ -193,8 +174,8 @@ async fn forward(
     logging::status(
         status.as_u16(),
         format_args!(
-            "POST /openai/v1/responses {status} model={model} shelley_request_id={:?} body={inbound_size} zstd={upstream_zstd_size} header_latency={} ms",
-            request_id.as_deref().unwrap_or("-"),
+            "POST /codex/responses {status} session={session} body={} header_latency={} ms",
+            human_bytes(body.len() as u64),
             started.elapsed().as_millis()
         ),
     );
@@ -211,18 +192,17 @@ async fn forward(
 
 async fn send_with_recovery(
     gateway: &Gateway,
+    headers: &HeaderMap,
     body: &Bytes,
-    cache_key: &Option<String>,
-    model: &str,
 ) -> Result<reqwest::Response, Box<Response>> {
     let (token, account_id) = gateway
         .auth
         .credentials()
         .await
         .map_err(|err| Box::new(auth_error_response(err)))?;
-    let mut response = send_upstream(gateway, body, cache_key, &token, &account_id)
+    let mut response = send_upstream(gateway, headers, body, &token, &account_id)
         .await
-        .map_err(|err| Box::new(upstream_error_response(err, model)))?;
+        .map_err(|err| Box::new(upstream_error_response(&err)))?;
     // 401 before streaming starts: recover and replay exactly once.
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         let (token, account_id) = gateway
@@ -231,41 +211,176 @@ async fn send_with_recovery(
             .await
             .map_err(|err| Box::new(auth_error_response(err)))?;
         logging::warning(format_args!(
-            "upstream 401 for {model}; replaying once with recovered credential"
+            "upstream 401; replaying once with recovered credential"
         ));
-        response = send_upstream(gateway, body, cache_key, &token, &account_id)
+        response = send_upstream(gateway, headers, body, &token, &account_id)
             .await
-            .map_err(|err| Box::new(upstream_error_response(err, model)))?;
+            .map_err(|err| Box::new(upstream_error_response(&err)))?;
     }
     Ok(response)
 }
 
-/// Inbound headers (Shelley's `Bearer implicit` included) are never forwarded; this
-/// trusted set replaces them.
 async fn send_upstream(
     gateway: &Gateway,
+    headers: &HeaderMap,
     body: &Bytes,
-    cache_key: &Option<String>,
     token: &AccessToken,
     account_id: &AccountId,
 ) -> reqwest::Result<reqwest::Response> {
     let mut upstream = gateway
         .http
         .post(&gateway.upstream_url)
-        .header(header::AUTHORIZATION, format!("Bearer {}", token.as_str()))
-        .header("chatgpt-account-id", account_id.as_str())
-        .header("originator", crate::ORIGINATOR)
-        .header(header::USER_AGENT, crate::user_agent())
-        .header("OpenAI-Beta", "responses=experimental")
-        .header(header::ACCEPT, "text/event-stream")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CONTENT_ENCODING, "zstd");
-    if let Some(key) = cache_key {
-        upstream = upstream
-            .header("session-id", key)
-            .header("x-client-request-id", key);
+        .headers(forwarded(headers));
+    for (name, value) in credential_headers(token, account_id) {
+        upstream = upstream.header(name, value);
     }
     upstream.body(body.clone()).send().await
+}
+
+async fn connect(
+    State(gateway): State<Gateway>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let started = Instant::now();
+    let session = session_id(&headers).to_owned();
+    let upstream = match connect_with_recovery(&gateway, &headers).await {
+        Ok(upstream) => upstream,
+        Err(response) => return *response,
+    };
+    logging::status(
+        StatusCode::SWITCHING_PROTOCOLS.as_u16(),
+        format_args!(
+            "GET /codex/responses 101 session={session} handshake_latency={} ms",
+            started.elapsed().as_millis()
+        ),
+    );
+    upgrade
+        .max_message_size(usize::MAX)
+        .max_frame_size(usize::MAX)
+        .on_upgrade(move |client| relay(client, upstream, session))
+}
+
+async fn connect_with_recovery(
+    gateway: &Gateway,
+    headers: &HeaderMap,
+) -> Result<Upstream, Box<Response>> {
+    let (token, account_id) = gateway
+        .auth
+        .credentials()
+        .await
+        .map_err(|err| Box::new(auth_error_response(err)))?;
+    let connected = match connect_upstream(gateway, headers, &token, &account_id).await {
+        // 401 on the handshake: recover and connect again exactly once.
+        Err(ts::Error::Http(response)) if response.status() == StatusCode::UNAUTHORIZED => {
+            let (token, account_id) = gateway
+                .auth
+                .recover(&token)
+                .await
+                .map_err(|err| Box::new(auth_error_response(err)))?;
+            logging::warning(format_args!(
+                "upstream 401; reconnecting once with recovered credential"
+            ));
+            connect_upstream(gateway, headers, &token, &account_id).await
+        }
+        connected => connected,
+    };
+    connected.map_err(|err| Box::new(websocket_error_response(err)))
+}
+
+async fn connect_upstream(
+    gateway: &Gateway,
+    headers: &HeaderMap,
+    token: &AccessToken,
+    account_id: &AccountId,
+) -> Result<Upstream, ts::Error> {
+    let mut url = reqwest::Url::parse(&gateway.upstream_url).expect("upstream URL is valid");
+    let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
+    url.set_scheme(scheme)
+        .expect("http(s) and ws(s) are interchangeable schemes");
+    let mut request = url.as_str().into_client_request()?;
+    request.headers_mut().extend(forwarded(headers));
+    for (name, value) in credential_headers(token, account_id) {
+        let value = HeaderValue::from_str(&value).map_err(ts::http::Error::from)?;
+        request.headers_mut().insert(name, value);
+    }
+    let config = WebSocketConfig::default()
+        .max_message_size(None)
+        .max_frame_size(None);
+    let (upstream, _) =
+        tokio_tungstenite::connect_async_with_config(request, Some(config), true).await?;
+    Ok(upstream)
+}
+
+/// Each side answers its own pings; everything else crosses unchanged until either
+/// side closes.
+async fn relay(client: WebSocket, upstream: Upstream, session: String) {
+    let started = Instant::now();
+    let (mut client_tx, mut client_rx) = client.split();
+    let (mut upstream_tx, mut upstream_rx) = upstream.split();
+    let to_upstream = async {
+        while let Some(message) = client_rx.next().await {
+            if let Some(message) = to_upstream_message(message?) {
+                upstream_tx.send(message).await?;
+            }
+        }
+        anyhow::Ok(())
+    };
+    let to_client = async {
+        while let Some(message) = upstream_rx.next().await {
+            if let Some(message) = to_client_message(message?) {
+                client_tx.send(message).await?;
+            }
+        }
+        anyhow::Ok(())
+    };
+    let result = tokio::select! {
+        result = to_upstream => result,
+        result = to_client => result,
+    };
+    let seconds = started.elapsed().as_secs();
+    match result {
+        Ok(()) => logging::success(format_args!(
+            "websocket session={session} closed after {seconds} s"
+        )),
+        Err(error) => logging::error(format_args!(
+            "websocket session={session} failed after {seconds} s: {error:#}"
+        )),
+    }
+}
+
+fn to_upstream_text(text: ws::Utf8Bytes) -> ts::Utf8Bytes {
+    ts::Utf8Bytes::try_from(Bytes::from(text)).expect("axum text is UTF-8")
+}
+
+fn to_client_text(text: ts::Utf8Bytes) -> ws::Utf8Bytes {
+    ws::Utf8Bytes::try_from(Bytes::from(text)).expect("tungstenite text is UTF-8")
+}
+
+fn to_upstream_message(message: ws::Message) -> Option<ts::Message> {
+    match message {
+        ws::Message::Text(text) => Some(ts::Message::Text(to_upstream_text(text))),
+        ws::Message::Binary(bytes) => Some(ts::Message::Binary(bytes)),
+        ws::Message::Close(frame) => Some(ts::Message::Close(frame.map(|frame| {
+            ts::protocol::CloseFrame {
+                code: frame.code.into(),
+                reason: to_upstream_text(frame.reason),
+            }
+        }))),
+        ws::Message::Ping(_) | ws::Message::Pong(_) => None,
+    }
+}
+
+fn to_client_message(message: ts::Message) -> Option<ws::Message> {
+    match message {
+        ts::Message::Text(text) => Some(ws::Message::Text(to_client_text(text))),
+        ts::Message::Binary(bytes) => Some(ws::Message::Binary(bytes)),
+        ts::Message::Close(frame) => Some(ws::Message::Close(frame.map(|frame| ws::CloseFrame {
+            code: frame.code.into(),
+            reason: to_client_text(frame.reason),
+        }))),
+        ts::Message::Ping(_) | ts::Message::Pong(_) | ts::Message::Frame(_) => None,
+    }
 }
 
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
@@ -282,51 +397,15 @@ fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     chain
 }
 
-fn body_rejection_response(
-    error: BytesRejection,
-    content_length: Option<u64>,
-    request_id: Option<&str>,
-) -> Response {
-    match error {
-        BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_)) => {
-            let content_length_log = content_length
-                .map(|bytes| format!(" content_length={}", human_bytes(bytes)))
-                .unwrap_or_default();
-            let request_id_log = request_id
-                .map(|id| format!(" shelley_request_id={id:?}"))
-                .unwrap_or_default();
-            logging::status(
-                StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
-                format_args!(
-                    "POST /openai/v1/responses status=413 limit={}{content_length_log}{request_id_log}",
-                    human_bytes(INBOUND_BODY_LIMIT_BYTES as u64)
-                ),
-            );
-            let message = content_length.map_or_else(
-                || format!("request body exceeds the 64 MiB limit ({INBOUND_BODY_LIMIT_BYTES} bytes)"),
-                |bytes| {
-                    format!(
-                        "request body exceeds the 64 MiB limit ({INBOUND_BODY_LIMIT_BYTES} bytes); received Content-Length {bytes} bytes"
-                    )
-                },
-            );
-            error_response(StatusCode::PAYLOAD_TOO_LARGE, &message)
-        }
-        error => {
-            let content_length_log = content_length
-                .map(|bytes| format!(" content_length={bytes}"))
-                .unwrap_or_default();
-            let error = error_chain(&error);
-            logging::status(
-                StatusCode::BAD_REQUEST.as_u16(),
-                format_args!(
-                    "POST /openai/v1/responses status=400 shelley_request_id={:?}{content_length_log} body_buffer_error={error:?}",
-                    request_id.unwrap_or("-")
-                ),
-            );
-            error_response(StatusCode::BAD_REQUEST, "failed to buffer request body")
-        }
-    }
+fn body_rejection_response(error: &BytesRejection, session: &str) -> Response {
+    let error = error_chain(error);
+    logging::status(
+        StatusCode::BAD_REQUEST.as_u16(),
+        format_args!(
+            "POST /codex/responses status=400 session={session} body_buffer_error={error:?}"
+        ),
+    );
+    error_response(StatusCode::BAD_REQUEST, "failed to buffer request body")
 }
 
 fn auth_error_response(err: AuthError) -> Response {
@@ -342,26 +421,41 @@ fn auth_error_response(err: AuthError) -> Response {
     }
 }
 
-fn upstream_error_response(err: reqwest::Error, model: &str) -> Response {
-    logging::error(format_args!("upstream request failed for {model}: {err}"));
+fn upstream_error_response(err: &reqwest::Error) -> Response {
+    let err = error_chain(err);
+    logging::error(format_args!("upstream request failed: {err}"));
     error_response(
         StatusCode::BAD_GATEWAY,
         &format!("upstream request failed: {err}"),
     )
 }
 
-/// Drop `max_output_tokens` (absent from the Codex schema), force `store:false` /
-/// `stream:true`; pass the rest (Lark tools, encrypted reasoning) untouched.
-fn adapt_request(body: &[u8]) -> Result<Value, &'static str> {
-    let mut request: Value =
-        serde_json::from_slice(body).map_err(|_| "request body is not valid JSON")?;
-    let object = request
-        .as_object_mut()
-        .ok_or("request body must be a JSON object")?;
-    object.remove("max_output_tokens");
-    object.insert("store".to_owned(), Value::Bool(false));
-    object.insert("stream".to_owned(), Value::Bool(true));
-    Ok(request)
+/// A refused handshake is relayed with the backend's own status and body; anything
+/// else is a 502.
+fn websocket_error_response(err: ts::Error) -> Response {
+    let ts::Error::Http(response) = err else {
+        let err = error_chain(&err);
+        logging::error(format_args!("upstream websocket failed: {err}"));
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            &format!("upstream websocket failed: {err}"),
+        );
+    };
+    let status = response.status();
+    logging::status(
+        status.as_u16(),
+        format_args!("GET /codex/responses {status}: upstream refused the websocket"),
+    );
+    let (parts, body) = response.into_parts();
+    let mut relayed = Response::builder().status(parts.status);
+    for (name, value) in &parts.headers {
+        if !skip_response_header(name.as_str()) {
+            relayed = relayed.header(name, value);
+        }
+    }
+    relayed
+        .body(Body::from(body.unwrap_or_default()))
+        .expect("relayed response headers are valid")
 }
 
 /// Hop-by-hop headers, plus set-cookie: upstream Cloudflare cookies belong in the
@@ -403,33 +497,19 @@ mod tests {
     }
 
     #[test]
-    fn adapt_strips_max_output_tokens_and_forces_flags() {
-        let body = json!({
-            "model": "gpt-5.4",
-            "max_output_tokens": 32768,
-            "store": false,
-            "stream": true,
-            "include": ["reasoning.encrypted_content"],
-            "tools": [{
-                "type": "custom",
-                "name": "apply_patch",
-                "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"},
-            }],
-            "input": [{"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "opaque"}],
-        });
-        let adapted = adapt_request(body.to_string().as_bytes()).expect("adapt request");
-        assert!(adapted.get("max_output_tokens").is_none());
-        assert_eq!(adapted["store"], json!(false));
-        assert_eq!(adapted["stream"], json!(true));
-        assert_eq!(adapted["tools"], body["tools"]);
-        assert_eq!(adapted["input"], body["input"]);
-        assert_eq!(adapted["include"], body["include"]);
-    }
-
-    #[test]
-    fn adapt_rejects_non_object_bodies() {
-        assert!(adapt_request(b"not json").is_err());
-        assert!(adapt_request(b"[1,2]").is_err());
+    fn forwards_only_request_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer caller".parse().expect("header"),
+        );
+        headers.insert("chatgpt-account-id", "caller".parse().expect("header"));
+        headers.insert(header::CONTENT_ENCODING, "zstd".parse().expect("header"));
+        headers.insert("session-id", "session-1".parse().expect("header"));
+        let forwarded = forwarded(&headers);
+        assert_eq!(forwarded.len(), 2);
+        assert_eq!(forwarded[header::CONTENT_ENCODING], "zstd");
+        assert_eq!(forwarded["session-id"], "session-1");
     }
 
     #[test]

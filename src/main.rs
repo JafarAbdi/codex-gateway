@@ -22,7 +22,7 @@ fn log_stderr(color: &str, message: Arguments<'_>) {
 }
 
 const USAGE: &str = "\
-Shared ChatGPT Codex OAuth gateway for Shelley
+Shared ChatGPT Codex OAuth gateway for pi
 
 Usage: codex-gateway [--auth-file PATH] <COMMAND> [--listen ADDR]
 
